@@ -7,9 +7,8 @@ __author__ = "Adrien Guille"
 __email__ = "adrien.guille@univ-lyon2.fr"
 __license__ = "MIT"
 
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq, BitsAndBytesConfig
-from huggingface_hub import login
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq
+from peft import LoraConfig, TaskType, get_peft_model
 from datasets import load_dataset
 import argparse
 import json
@@ -17,7 +16,6 @@ import pandas as pd
 from collections import defaultdict
 import numpy as np
 import os
-from tqdm import tqdm
 import torch; torch.set_float32_matmul_precision("high")
 
 parser = argparse.ArgumentParser(description='LoRA on encoder-decoder style LM for relation extraction')
@@ -34,6 +32,7 @@ parser.add_argument("-m", "--modules", type=str, default="qv")
 parser.add_argument("-do", "--dropout", type=float, default=0.05)
 parser.add_argument("-mx", "--max_length", type=int, default=512)
 parser.add_argument("-f", "--format", type=str, default="yes/no")
+parser.add_argument("-od", "--out_dir", type=str, default="output")
 args = parser.parse_args()
 print(args)
 
@@ -46,29 +45,24 @@ if args.modules == "all":
 lora_config = LoraConfig(
     lora_dropout=args.dropout,
     r=args.rank,
-    lora_alpha=args.rank * args.alpha_scale, 
+    lora_alpha=args.rank * args.alpha_scale,
     bias="none",
     task_type=TaskType.SEQ_2_SEQ_LM,
-    target_modules=modules, 
+    target_modules=modules,
 )
 
 #########
 # MODEL #
 #########
-if "flan" in args.checkpoint:
-    repo = "google"
-else:
-    repo = "bigscience" 
-checkpoint = f"{repo}/{args.checkpoint}"
-model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint, 
-                                              torch_dtype=torch.bfloat16, 
+model = AutoModelForSeq2SeqLM.from_pretrained(args.checkpoint,
+                                              torch_dtype=torch.bfloat16,
                                               device_map="auto")
 model = get_peft_model(model, lora_config)
 model.generation_config.max_new_tokens = 6
 model.generation_config.min_new_tokens = 1
 print(model.generation_config)
 model.print_trainable_parameters()
-tokenizer = AutoTokenizer.from_pretrained(checkpoint, truncation_side="right")
+tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, truncation_side="right")
 
 ########
 # DATA #
@@ -79,7 +73,7 @@ data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 def preprocess_function(examples):
     prompts = ['Does the relation {head_entity: ['+examples["head_entity"][i]+'], relation_type: '+examples["type"][i]+', tail_entity: ['+examples["tail_entity"][i]+']} exists in the following text: "'+examples["text"][i].replace('"', "")+'"?' for i in range(len(examples["answer"]))]
     answers = ["yes" if a == "true" else "no" for a in examples["answer"]]
-    if "google" in checkpoint:
+    if "flan" in args.checkpoint:
         prompts = [prompt.replace("{", "(").replace("}", ")") for prompt in prompts] # le tokenizer T5 ignore les accolades
     return tokenizer(prompts, text_target=answers, max_length=args.max_length, truncation=True)
 tokenized_dataset = dataset.map(
@@ -160,7 +154,9 @@ if "no_val" not in args.data:
 # TRAINING #
 ############
 save_steps = (len(dataset["train"]) / (args.batch_size * args.gradient_accumulation)) // 12
-out_dir = f"{args.checkpoint}-{args.data}-r{args.rank}-{args.modules}"
+
+chkpt_name = os.path.basename(args.checkpoint)
+out_dir = f"{args.out_dir}/{chkpt_name}-{args.data}-r{args.rank}-{args.modules}"
 training_arguments = Seq2SeqTrainingArguments(
     report_to=None,
     seed=0,
@@ -196,7 +192,7 @@ trainer = Seq2SeqTrainer(
     data_collator=data_collator,
     args=training_arguments,
     preprocess_logits_for_metrics=None if "no_val" in args.data else preprocess_logits_for_metrics,
-    compute_metrics=None if "no_val" in args.data else compute_metrics, 
+    compute_metrics=None if "no_val" in args.data else compute_metrics,
 )
 
 trainer.train()
